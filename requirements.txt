@@ -1,11 +1,11 @@
 # requirements.txt
-fastapi==0.110.0
-uvicorn[standard]==0.29.0
-cohere==5.4.1
-groq==0.7.0
-langchain==0.2.0
-langchain-cohere==0.1.0
-numpy==1.26.4
-pydantic==2.7.0
-python-multipart==0.0.9
-python-dotenv==1.0.1
+fastapi
+uvicorn[standard]
+cohere
+groq
+langchain
+langchain-cohere
+numpy
+pydantic
+python-multipart
+python-dotenv
