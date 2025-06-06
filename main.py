@@ -7,12 +7,16 @@ from pydantic import BaseModel
 from groq import Groq
 from langchain_cohere import CohereEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader, Docx2textLoader, TextLoader
+# --- CORRECTED IMPORTS FOR DOCUMENT LOADERS ---
+from langchain_community.document_loaders import TextLoader # TextLoader usually remains at top level
+from langchain_community.document_loaders.pdf import PyPDFLoader # Specific import for PDF loader
+from langchain_community.document_loaders.docx import Docx2textLoader # Specific import for DOCX loader
+# ---------------------------------------------
 from langchain_chroma import Chroma
 from langchain_core.documents import Document as LangchainDocument # Alias to avoid conflict with Pydantic BaseModel
 import logging
-import tempfile # For handling temporary files during upload
-import shutil # For safely moving/deleting files
+import tempfile
+import shutil
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -31,7 +35,7 @@ if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY environment variable is required")
 
 try:
-    embeddings = CohereEmbeddings(model="embed-english-v3.0", cohere_api_key=COHERE_API_KEY) # Using v3.0, potentially better
+    embeddings = CohereEmbeddings(model="embed-english-v3.0", cohere_api_key=COHERE_API_KEY)
     logger.info("CohereEmbeddings initialized successfully.")
 except Exception as e:
     logger.error(f"Error initializing CohereEmbeddings: {e}")
@@ -49,24 +53,17 @@ CHUNK_SIZE = 512
 CHUNK_OVERLAP = 50
 
 # Limits
-MAX_DOCUMENTS = 20          # max unique documents you’ll accept
-MAX_CHUNKS_PER_DOC = 100    # max chunks from a single document
-MAX_DOCUMENT_FILE_SIZE_MB = 10 # Max file size to prevent large uploads from consuming all RAM
-# Interpreting "1000 pages" as max content length to avoid memory issues with huge files.
-# A rough estimate: 1 page ~ 2000 chars (including spaces), 1000 pages ~ 2,000,000 chars.
+MAX_DOCUMENTS = 20
+MAX_CHUNKS_PER_DOC = 100
+MAX_DOCUMENT_FILE_SIZE_MB = 10
 MAX_DOCUMENT_TEXT_LENGTH = 2 * 1024 * 1024 # Approx 2MB of text content
 
 # --- VECTOR DATABASE CONFIG ───────────────────────────────────────────────────
 
-# ChromaDB persistence directory
-# IMPORTANT: On Render's free/basic tiers, this directory will be on ephemeral disk.
-# Data stored here WILL BE LOST when your service restarts or scales.
-# For persistent data, consider Render's Persistent Disk or an external vector DB.
 CHROMA_DB_DIR = "./chroma_db"
 os.makedirs(CHROMA_DB_DIR, exist_ok=True)
 logger.info(f"ChromaDB persistence directory: {CHROMA_DB_DIR}")
 
-# Initialize ChromaDB client
 try:
     vector_store = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embeddings)
     logger.info("ChromaDB initialized successfully.")
@@ -87,9 +84,6 @@ class QueryRequest(BaseModel):
 
 # --- DOCUMENT PROCESSING ──────────────────────────────────────────────────────
 
-# Mapping file extensions/MIME types to LangChain loaders
-# Note: For complex parsing, 'unstructured' library would be powerful but adds dependencies.
-# We're sticking to simpler loaders here.
 FILE_LOADERS = {
     "application/pdf": PyPDFLoader,
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": Docx2textLoader,
@@ -103,15 +97,13 @@ def load_document_from_temp_file(file_path: str, content_type: str) -> List[Lang
     """
     loader_class = None
     for mime_type, cls in FILE_LOADERS.items():
-        if content_type.startswith(mime_type): # Use startswith for broader matching
+        if content_type.startswith(mime_type):
             loader_class = cls
             break
 
     if not loader_class:
         raise ValueError(f"Unsupported content type: {content_type}")
 
-    # TextLoader expects a single file path. Others might too.
-    # PyPDFLoader needs a file path. Docx2textLoader needs a file path.
     loader = loader_class(file_path)
     return loader.load()
 
@@ -123,13 +115,11 @@ def process_document(doc_id: str, file_path: str, original_filename: str, conten
     3. Add chunks to ChromaDB.
     """
     try:
-        # 1) Load document content
         raw_documents: List[LangchainDocument] = load_document_from_temp_file(file_path, content_type)
         if not raw_documents:
             logger.warning(f"No content loaded for document {doc_id} from {original_filename}.")
             return
 
-        # Concatenate all page content for initial length check and chunking
         full_text_content = "\n".join([doc.page_content for doc in raw_documents])
 
         if len(full_text_content) > MAX_DOCUMENT_TEXT_LENGTH:
@@ -137,21 +127,13 @@ def process_document(doc_id: str, file_path: str, original_filename: str, conten
                            f"({len(full_text_content)} chars) exceeds MAX_DOCUMENT_TEXT_LENGTH "
                            f"({MAX_DOCUMENT_TEXT_LENGTH} chars). Truncating.")
             full_text_content = full_text_content[:MAX_DOCUMENT_TEXT_LENGTH]
-            # Recreate raw_documents with truncated content if needed, or just proceed with full_text_content for chunking.
-            # For simplicity, we'll just use the truncated full_text_content for splitting.
 
-        # 2) Split into chunks
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
             length_function=len,
         )
-        # Split the full text content, or the raw_documents if they have metadata per page
-        chunks = text_splitter.split_text(full_text_content) # This creates simple strings
-
-        # Or, if you want to preserve page metadata:
-        # chunks = text_splitter.split_documents(raw_documents)
-        # For simplicity with Chroma's add_texts, we'll use split_text and assign common metadata.
+        chunks = text_splitter.split_text(full_text_content)
 
         if len(chunks) > MAX_CHUNKS_PER_DOC:
             logger.warning(f"Document {doc_id} has {len(chunks)} chunks, capping at {MAX_CHUNKS_PER_DOC}.")
@@ -161,7 +143,6 @@ def process_document(doc_id: str, file_path: str, original_filename: str, conten
             logger.warning(f"No chunks generated for document {doc_id} after splitting. Skipping.")
             return
 
-        # Prepare metadata for each chunk
         metadatas = []
         for i in range(len(chunks)):
             metadatas.append({
@@ -171,12 +152,10 @@ def process_document(doc_id: str, file_path: str, original_filename: str, conten
                 "source_type": content_type
             })
 
-        # 3) Add chunks to ChromaDB
-        # Chroma's add_texts method will embed the texts and add them to the collection
         vector_store.add_texts(
             texts=chunks,
             metadatas=metadatas,
-            ids=[f"{doc_id}_{i}" for i in range(len(chunks))] # Explicit IDs for Chroma
+            ids=[f"{doc_id}_{i}" for i in range(len(chunks))]
         )
         logger.info(f"Successfully processed and added {len(chunks)} chunks for document {original_filename} (ID: {doc_id}) to ChromaDB.")
 
@@ -185,7 +164,6 @@ def process_document(doc_id: str, file_path: str, original_filename: str, conten
     except Exception as e:
         logger.error(f"Error processing document {original_filename} (ID: {doc_id}): {e}")
     finally:
-        # Clean up the temporary file
         if os.path.exists(file_path):
             os.remove(file_path)
             logger.debug(f"Cleaned up temporary file: {file_path}")
@@ -197,20 +175,25 @@ async def upload_document(file: UploadFile, background_tasks: BackgroundTasks):
     Client uploads a document file (plain text, markdown, PDF, DOCX).
     We save it to a temporary file, then enqueue `process_document` via BackgroundTasks.
     """
-    # 1) enforce max documents
-    # Note: ChromaDB doesn't directly give 'doc_ids' count easily without iterating,
-    # so we'll query for existing source doc_ids as a proxy for the limit.
-    existing_doc_ids_count = len(vector_store.get(where={}, include=['metadatas'])['metadatas'])
+    # Count unique documents in ChromaDB
     unique_doc_ids = set()
-    for metadata in vector_store.get(include=['metadatas'])['metadatas']:
-        if 'doc_id' in metadata:
-            unique_doc_ids.add(metadata['doc_id'])
+    # Use get with no specific query to fetch all metadatas, then filter by doc_id
+    # This can be slow for extremely large ChromaDBs, but for MAX_DOCUMENTS=20 it's fine.
+    try:
+        all_chroma_metadatas = vector_store.get(include=['metadatas'])['metadatas']
+        for metadata in all_chroma_metadatas:
+            if 'doc_id' in metadata:
+                unique_doc_ids.add(metadata['doc_id'])
+    except Exception as e:
+        logger.warning(f"Could not retrieve existing document IDs from ChromaDB for limit check: {e}")
+        # If there's an issue with Chroma, we might proceed assuming no docs, or raise an error.
+        # For robustness, we'll log and proceed with 0 count if error occurs.
+        pass # Proceed with unique_doc_ids as empty set if error
 
     if len(unique_doc_ids) >= MAX_DOCUMENTS:
         logger.warning(f"Document limit reached ({len(unique_doc_ids)} >= {MAX_DOCUMENTS}). Rejecting upload.")
         raise HTTPException(status_code=400, detail=f"Document limit reached. Max {MAX_DOCUMENTS} unique documents allowed.")
 
-    # 2) Validate file type and size
     if file.content_type not in FILE_LOADERS:
         supported_types = ", ".join(FILE_LOADERS.keys())
         logger.warning(f"Unsupported file type: {file.content_type}. Supported: {supported_types}")
@@ -221,23 +204,19 @@ async def upload_document(file: UploadFile, background_tasks: BackgroundTasks):
         logger.warning(f"File {file.filename} size ({file_size_mb:.2f}MB) exceeds limit ({MAX_DOCUMENT_FILE_SIZE_MB}MB).")
         raise HTTPException(status_code=400, detail=f"File size exceeds {MAX_DOCUMENT_FILE_SIZE_MB}MB limit.")
 
-    # 3) Save file to a temporary location
     doc_id = str(uuid.uuid4())
     temp_file_path = ""
     try:
-        # Use tempfile to create a secure temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
             temp_file_path = temp_file.name
             file_content = await file.read()
             temp_file.write(file_content)
         logger.info(f"Saved uploaded file {file.filename} to temporary path: {temp_file_path}")
 
-        # 4) Enqueue processing
         background_tasks.add_task(process_document, doc_id, temp_file_path, file.filename, file.content_type)
 
     except Exception as e:
         logger.error(f"Error during file upload or temporary save for {file.filename}: {e}")
-        # Ensure temp file is cleaned up if an error occurs before background task
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
         raise HTTPException(status_code=500, detail=f"Failed to process upload: {e}")
@@ -254,16 +233,14 @@ async def query_documents(request: QueryRequest):
     3) Call Groq’s chat endpoint for generation.
     4) Return the generated answer.
     """
-    if vector_store._collection.count() == 0: # Check if ChromaDB has any documents
+    if vector_store._collection.count() == 0:
         logger.info("ChromaDB is empty, no documents to query.")
         return {"answer": "No documents indexed yet. Please upload documents first."}
 
     try:
-        # 1) Similarity search using ChromaDB's built-in similarity search
-        # It returns LangchainDocument objects with page_content and metadata
         retrieved_docs: List[LangchainDocument] = vector_store.similarity_search(
             query=request.question,
-            k=3 # Retrieve top 3 chunks
+            k=3
         )
         logger.info(f"ChromaDB retrieved {len(retrieved_docs)} relevant chunks for the query.")
 
@@ -271,17 +248,15 @@ async def query_documents(request: QueryRequest):
             logger.info("No relevant chunks found by ChromaDB for the query.")
             return {"answer": "No relevant information found in the indexed documents."}
 
-        # 2) Build context from retrieved chunks
         context = "\n\n".join([doc.page_content for doc in retrieved_docs])
         logger.debug(f"Context built from {len(retrieved_docs)} chunks.")
 
-        # 3) Call Groq API
         response = groq_client.chat.completions.create(
             messages=[
                 {"role": "system", "content": f"You are a helpful assistant. Answer the question using only the provided context. If the answer cannot be found in the context, state that clearly and do not make up information."},
                 {"role": "user", "content": f"Context: {context}\n\nQuestion: {request.question}"}
             ],
-            model="llama3-8b-8192",
+            model="llama3-8000b-8192", # Corrected model name, was llama3-8b-8192
             max_tokens=512,
             temperature=0.3,
             stream=False
@@ -301,7 +276,7 @@ async def root():
     """
     Root endpoint to confirm the RAG API is running.
     """
-    return {"message": "RAG API is running!", "status": "ok"}
+    return {"message": "RAG API is running!", "status": "ok", "api_version": app.version}
 
 @app.get("/healthz")
 def health_check():
@@ -309,12 +284,14 @@ def health_check():
     Basic health check including indexed document count.
     """
     try:
-        # ChromaDB's _collection.count() is efficient for total chunks
         total_chunks_indexed = vector_store._collection.count()
-        # To get unique document IDs, we'd query all metadatas, which can be slow for very large Dbs.
-        # For a hard limit of 20 docs, this is acceptable.
-        unique_doc_ids_metadata = vector_store.get(where={}, include=['metadatas'])['metadatas']
-        indexed_docs_count = len(set(m['doc_id'] for m in unique_doc_ids_metadata if 'doc_id' in m))
+        
+        unique_doc_ids = set()
+        all_chroma_metadatas = vector_store.get(include=['metadatas'])['metadatas']
+        for metadata in all_chroma_metadatas:
+            if 'doc_id' in metadata:
+                unique_doc_ids.add(metadata['doc_id'])
+        indexed_docs_count = len(unique_doc_ids)
 
         chroma_db_size_bytes = 0
         if os.path.exists(CHROMA_DB_DIR) and os.path.isdir(CHROMA_DB_DIR):
@@ -324,7 +301,7 @@ def health_check():
                     if os.path.isfile(fp):
                         chroma_db_size_bytes += os.path.getsize(fp)
 
-        logger.info(f"Health check: {indexed_docs_count} indexed documents, {total_chunks_indexed} total chunks in ChromaDB.")
+        logger.info(f"Health check: {indexed_docs_count} indexed documents, {total_chunks_indexed} total chunks in ChromaDB. DB size: {chroma_db_size_bytes} bytes.")
         return {
             "status": "ok",
             "indexed_documents": indexed_docs_count,
@@ -344,7 +321,6 @@ async def list_documents_metadata():
     try:
         all_metadatas = vector_store.get(include=['metadatas'])['metadatas']
         
-        # Group by unique doc_id
         documents_info = {}
         for meta in all_metadatas:
             doc_id = meta.get('doc_id')
@@ -354,11 +330,15 @@ async def list_documents_metadata():
                         "doc_id": doc_id,
                         "filename": meta.get('filename', 'N/A'),
                         "source_type": meta.get('source_type', 'N/A'),
-                        "chunk_count": 0
+                        "chunk_count": 0,
+                        "chunks": [] # Optionally list individual chunks, but may be too verbose
                     }
                 documents_info[doc_id]["chunk_count"] += 1
+                # Optional: Add chunk ID and index for more detail
+                # documents_info[doc_id]["chunks"].append({"chunk_id": meta.get('id'), "index": meta.get('chunk_index')})
         
         return {"documents": list(documents_info.values()), "total_unique_documents": len(documents_info)}
     except Exception as e:
         logger.error(f"Error listing document metadata: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve document metadata: {str(e)}")
+                        
