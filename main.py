@@ -8,36 +8,24 @@ from groq import Groq
 from langchain_cohere import CohereEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# --- Standard Library Imports (these should always be at the very top) ---
-import logging # Import logging module first
+# --- Standard Library Imports ---
+import logging
 import tempfile
 import shutil
 
-# --- CONFIGURE LOGGING HERE (BEFORE ANY USE OF 'logger') ---
+# --- CONFIGURE LOGGING HERE ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__) # Initialize the logger object
-# -----------------------------------------------------------
+logger = logging.getLogger(__name__)
+# ------------------------------
 
-# --- CORRECTED IMPORTS FOR DOCUMENT LOADERS ---
-from langchain_community.document_loaders import TextLoader, PyPDFLoader # Check if these are still directly available
-try:
-    from langchain_community.document_loaders import Docx2textLoader # Try top-level again, in case it's re-exported
-except ImportError as e:
-    # Use the now-defined 'logger' object for error reporting
-    logger.warning(f"Could not import Docx2textLoader from top-level: {e}. Trying alternate path.")
-    try:
-        from langchain_community.document_loaders.word_document import Docx2textLoader # Alternate path
-        logger.info("Successfully imported Docx2textLoader from langchain_community.document_loaders.word_document.")
-    except ImportError as e_alt:
-        logger.error(f"Could not import Docx2textLoader from any known path. Ensure python-docx is installed and langchain-community is compatible. Original error: {e_alt}")
-        raise ImportError("Failed to import Docx2textLoader. Check dependencies and LangChain version.") from e_alt
+# --- CORRECTED IMPORTS FOR DOCUMENT LOADERS (Only PDF and Text/MD) ---
+from langchain_community.document_loaders import TextLoader, PyPDFLoader
+# Docx2textLoader imports are removed as per user request
+# ---------------------------------------------------------------------
 
-# ---------------------------------------------
 from langchain_chroma import Chroma
 from langchain_core.documents import Document as LangchainDocument # Alias to avoid conflict with Pydantic BaseModel
 
-
-# --- REST OF YOUR CODE REMAINS THE SAME ---
 
 # --- CONFIG ────────────────────────────────────────────────────────────────────
 
@@ -101,9 +89,9 @@ class QueryRequest(BaseModel):
 
 # --- DOCUMENT PROCESSING ──────────────────────────────────────────────────────
 
+# FILE_LOADERS updated to remove Docx2textLoader
 FILE_LOADERS = {
     "application/pdf": PyPDFLoader,
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": Docx2textLoader,
     "text/plain": TextLoader,
     "text/markdown": TextLoader,
 }
@@ -119,7 +107,8 @@ def load_document_from_temp_file(file_path: str, content_type: str) -> List[Lang
             break
 
     if not loader_class:
-        raise ValueError(f"Unsupported content type: {content_type}")
+        # Raise HTTPException directly for unsupported types at this point
+        raise HTTPException(status_code=400, detail=f"Unsupported file type. Supported types: {', '.join(FILE_LOADERS.keys())}")
 
     loader = loader_class(file_path)
     return loader.load()
@@ -176,10 +165,14 @@ def process_document(doc_id: str, file_path: str, original_filename: str, conten
         )
         logger.info(f"Successfully processed and added {len(chunks)} chunks for document {original_filename} (ID: {doc_id}) to ChromaDB.")
 
+    except HTTPException: # Re-raise if it's an HTTPException from load_document_from_temp_file
+        raise
     except ValueError as ve:
         logger.error(f"Error loading document {original_filename} (ID: {doc_id}): {ve}")
+        raise HTTPException(status_code=400, detail=f"Error loading document: {ve}")
     except Exception as e:
         logger.error(f"Error processing document {original_filename} (ID: {doc_id}): {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during document processing: {e}")
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -192,7 +185,6 @@ async def upload_document(file: UploadFile, background_tasks: BackgroundTasks):
     Client uploads a document file (plain text, markdown, PDF, DOCX).
     We save it to a temporary file, then enqueue `process_document` via BackgroundTasks.
     """
-    # Count unique documents in ChromaDB
     unique_doc_ids = set()
     try:
         all_chroma_metadatas = vector_store.get(include=['metadatas'])['metadatas']
@@ -228,6 +220,8 @@ async def upload_document(file: UploadFile, background_tasks: BackgroundTasks):
 
         background_tasks.add_task(process_document, doc_id, temp_file_path, file.filename, file.content_type)
 
+    except HTTPException: # Re-raise if it's an HTTPException from earlier checks
+        raise
     except Exception as e:
         logger.error(f"Error during file upload or temporary save for {file.filename}: {e}")
         if os.path.exists(temp_file_path):
