@@ -11,3 +11,4 @@ numpy
 pydantic
 python-multipart
 python-dotenv
+pypdf
