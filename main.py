@@ -7,10 +7,17 @@ from pydantic import BaseModel
 from groq import Groq
 from langchain_cohere import CohereEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-# --- CORRECTED IMPORTS FOR DOCUMENT LOADERS ---
-from langchain_community.document_loaders import TextLoader # TextLoader usually remains at top level
-from langchain_community.document_loaders.pdf import PyPDFLoader # Specific import for PDF loader
-from langchain_community.document_loaders.docx import Docx2textLoader # Specific import for DOCX loader
+# --- CORRECTED IMPORTS FOR DOCUMENT LOADERS (Attempt 2) ---
+from langchain_community.document_loaders import TextLoader, PyPDFLoader # Check if these are still directly available
+try:
+    from langchain_community.document_loaders import Docx2textLoader # Try top-level again, in case it's re-exported
+except ImportError:
+    try:
+        from langchain_community.document_loaders.word_document import Docx2textLoader # Alternate path, try this.
+    except ImportError as e:
+        logger.error(f"Could not import Docx2textLoader: {e}")
+        raise ImportError("Could not import Docx2textLoader. Ensure python-docx is installed.") from e
+
 # ---------------------------------------------
 from langchain_chroma import Chroma
 from langchain_core.documents import Document as LangchainDocument # Alias to avoid conflict with Pydantic BaseModel
@@ -202,7 +209,7 @@ async def upload_document(file: UploadFile, background_tasks: BackgroundTasks):
     file_size_mb = file.size / (1024 * 1024) if file.size else 0
     if file_size_mb > MAX_DOCUMENT_FILE_SIZE_MB:
         logger.warning(f"File {file.filename} size ({file_size_mb:.2f}MB) exceeds limit ({MAX_DOCUMENT_FILE_SIZE_MB}MB).")
-        raise HTTPException(status_code=400, detail=f"File size exceeds {MAX_DOCUMENT_FILE_SIZE_MB}MB limit.")
+        raise HTTPException(status_code=400, detail=f"File size exceeds {MAX_DOCUMENT_FILE_SIZE_MB} limit.")
 
     doc_id = str(uuid.uuid4())
     temp_file_path = ""
@@ -341,4 +348,3 @@ async def list_documents_metadata():
     except Exception as e:
         logger.error(f"Error listing document metadata: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve document metadata: {str(e)}")
-                        
