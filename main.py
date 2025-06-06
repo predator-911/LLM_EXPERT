@@ -263,7 +263,7 @@ async def query_documents(request: QueryRequest):
                 {"role": "system", "content": f"You are a helpful assistant. Answer the question using only the provided context. If the answer cannot be found in the context, state that clearly and do not make up information."},
                 {"role": "user", "content": f"Context: {context}\n\nQuestion: {request.question}"}
             ],
-            model="llama3-8000b-8192",
+            model="llama3-8b-8192",
             max_tokens=512,
             temperature=0.3,
             stream=False
