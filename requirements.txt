@@ -1,8 +1,10 @@
-langchain
-langchain-huggingface
-sentence-transformers
-groq
-chromadb
-pydantic
 fastapi
 uvicorn
+groq
+langchain==0.2.1
+langchain-community
+langchain-huggingface
+sentence-transformers
+chromadb
+python-docx
+pypdf2
