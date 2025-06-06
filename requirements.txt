@@ -1,22 +1,11 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-
-# Embeddings via Cohere (free tier, zero local RAM)
-cohere==5.5.0
-langchain==0.2.1
-
-# Vector math
-numpy==1.24.4
-
-# Persistence
-pydantic==2.5.0
-
-# Document parsing (if you still plan to accept PDF/DOCX)
-PyPDF2==3.0.1
-python-docx==1.1.0
-
-# Groq client
-groq==0.3.0
-
-# (Optional) For background‐task pickling
-python-dotenv==1.0.0
+# requirements.txt
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+cohere==5.4.1
+groq==0.7.0
+langchain==0.2.0
+langchain-cohere==0.1.0
+numpy==1.26.4
+pydantic==2.7.0
+python-multipart==0.0.9
+python-dotenv==1.0.1
