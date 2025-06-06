@@ -5,6 +5,7 @@ cohere
 groq
 langchain
 langchain-cohere
+langchain-community
 numpy
 pydantic
 python-multipart
