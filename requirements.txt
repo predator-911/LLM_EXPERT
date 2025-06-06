@@ -1,8 +1,12 @@
-# requirements.txt
-fastapi>=0.68.0
-uvicorn>=0.15.0
+fastapi>=0.85.0
+uvicorn[standard]>=0.18.0
 groq>=0.3.0
 langchain>=0.0.340
+langchain-community>=0.0.20
+langchain-core>=0.0.20
 chromadb>=0.4.10
 sentence-transformers>=2.2.2
 python-multipart>=0.0.5
+streamlit>=1.20.0
+requests>=2.28.0
+pytest>=7.1.0
