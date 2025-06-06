@@ -7,7 +7,15 @@ import numpy as np
 from typing import List, Dict
 from fastapi import FastAPI, UploadFile, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from groq import AsyncGroq
+# old import
+# from groq import AsyncGroq
+from groq import GroqClient  # ✅ updated import
+
+...
+
+# old client initialization
+# groq_client = Groq(api_key=GROQ_API_KEY)
+  # ✅ updated usage
 from langchain.embeddings import CohereEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
@@ -25,7 +33,7 @@ if not GROQ_API_KEY:
 embeddings = CohereEmbeddings(model="embed-english-v2", cohere_api_key=COHERE_API_KEY)
 
 # Groq client
-groq_client = Groq(api_key=GROQ_API_KEY)
+groq_client = GroqClient(api_key=GROQ_API_KEY)
 
 # Chunking parameters
 CHUNK_SIZE = 512
