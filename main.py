@@ -7,27 +7,37 @@ from pydantic import BaseModel
 from groq import Groq
 from langchain_cohere import CohereEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-# --- CORRECTED IMPORTS FOR DOCUMENT LOADERS (Attempt 2) ---
+
+# --- Standard Library Imports (these should always be at the very top) ---
+import logging # Import logging module first
+import tempfile
+import shutil
+
+# --- CONFIGURE LOGGING HERE (BEFORE ANY USE OF 'logger') ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__) # Initialize the logger object
+# -----------------------------------------------------------
+
+# --- CORRECTED IMPORTS FOR DOCUMENT LOADERS ---
 from langchain_community.document_loaders import TextLoader, PyPDFLoader # Check if these are still directly available
 try:
     from langchain_community.document_loaders import Docx2textLoader # Try top-level again, in case it's re-exported
-except ImportError:
+except ImportError as e:
+    # Use the now-defined 'logger' object for error reporting
+    logger.warning(f"Could not import Docx2textLoader from top-level: {e}. Trying alternate path.")
     try:
-        from langchain_community.document_loaders.word_document import Docx2textLoader # Alternate path, try this.
-    except ImportError as e:
-        logger.error(f"Could not import Docx2textLoader: {e}")
-        raise ImportError("Could not import Docx2textLoader. Ensure python-docx is installed.") from e
+        from langchain_community.document_loaders.word_document import Docx2textLoader # Alternate path
+        logger.info("Successfully imported Docx2textLoader from langchain_community.document_loaders.word_document.")
+    except ImportError as e_alt:
+        logger.error(f"Could not import Docx2textLoader from any known path. Ensure python-docx is installed and langchain-community is compatible. Original error: {e_alt}")
+        raise ImportError("Failed to import Docx2textLoader. Check dependencies and LangChain version.") from e_alt
 
 # ---------------------------------------------
 from langchain_chroma import Chroma
 from langchain_core.documents import Document as LangchainDocument # Alias to avoid conflict with Pydantic BaseModel
-import logging
-import tempfile
-import shutil
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+
+# --- REST OF YOUR CODE REMAINS THE SAME ---
 
 # --- CONFIG ────────────────────────────────────────────────────────────────────
 
@@ -184,8 +194,6 @@ async def upload_document(file: UploadFile, background_tasks: BackgroundTasks):
     """
     # Count unique documents in ChromaDB
     unique_doc_ids = set()
-    # Use get with no specific query to fetch all metadatas, then filter by doc_id
-    # This can be slow for extremely large ChromaDBs, but for MAX_DOCUMENTS=20 it's fine.
     try:
         all_chroma_metadatas = vector_store.get(include=['metadatas'])['metadatas']
         for metadata in all_chroma_metadatas:
@@ -193,9 +201,7 @@ async def upload_document(file: UploadFile, background_tasks: BackgroundTasks):
                 unique_doc_ids.add(metadata['doc_id'])
     except Exception as e:
         logger.warning(f"Could not retrieve existing document IDs from ChromaDB for limit check: {e}")
-        # If there's an issue with Chroma, we might proceed assuming no docs, or raise an error.
-        # For robustness, we'll log and proceed with 0 count if error occurs.
-        pass # Proceed with unique_doc_ids as empty set if error
+        pass
 
     if len(unique_doc_ids) >= MAX_DOCUMENTS:
         logger.warning(f"Document limit reached ({len(unique_doc_ids)} >= {MAX_DOCUMENTS}). Rejecting upload.")
@@ -263,7 +269,7 @@ async def query_documents(request: QueryRequest):
                 {"role": "system", "content": f"You are a helpful assistant. Answer the question using only the provided context. If the answer cannot be found in the context, state that clearly and do not make up information."},
                 {"role": "user", "content": f"Context: {context}\n\nQuestion: {request.question}"}
             ],
-            model="llama3-8000b-8192", # Corrected model name, was llama3-8b-8192
+            model="llama3-8000b-8192",
             max_tokens=512,
             temperature=0.3,
             stream=False
@@ -338,13 +344,12 @@ async def list_documents_metadata():
                         "filename": meta.get('filename', 'N/A'),
                         "source_type": meta.get('source_type', 'N/A'),
                         "chunk_count": 0,
-                        "chunks": [] # Optionally list individual chunks, but may be too verbose
+                        "chunks": []
                     }
                 documents_info[doc_id]["chunk_count"] += 1
-                # Optional: Add chunk ID and index for more detail
-                # documents_info[doc_id]["chunks"].append({"chunk_id": meta.get('id'), "index": meta.get('chunk_index')})
         
         return {"documents": list(documents_info.values()), "total_unique_documents": len(documents_info)}
     except Exception as e:
         logger.error(f"Error listing document metadata: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve document metadata: {str(e)}")
+        
