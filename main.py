@@ -1,14 +1,18 @@
 import os
 import uuid
-import pickle
 import numpy as np
-from typing import List, Dict
+from typing import List, Dict, Union
 from fastapi import FastAPI, UploadFile, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from groq import Groq
-from langchain_cohere import CohereEmbeddings # Updated import for CohereEmbeddings
+from langchain_cohere import CohereEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, Docx2textLoader, TextLoader
+from langchain_chroma import Chroma
+from langchain_core.documents import Document as LangchainDocument # Alias to avoid conflict with Pydantic BaseModel
 import logging
+import tempfile # For handling temporary files during upload
+import shutil # For safely moving/deleting files
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -16,7 +20,6 @@ logger = logging.getLogger(__name__)
 
 # --- CONFIG ────────────────────────────────────────────────────────────────────
 
-# You must set these in Render's env‐vars: COHERE_API_KEY and GROQ_API_KEY
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -28,15 +31,13 @@ if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY environment variable is required")
 
 try:
-    # Cohere embedder (no local model load; calls Cohere’s API)
-    embeddings = CohereEmbeddings(model="embed-english-v2.0", cohere_api_key=COHERE_API_KEY) # Recommended newer model version
+    embeddings = CohereEmbeddings(model="embed-english-v3.0", cohere_api_key=COHERE_API_KEY) # Using v3.0, potentially better
     logger.info("CohereEmbeddings initialized successfully.")
 except Exception as e:
     logger.error(f"Error initializing CohereEmbeddings: {e}")
     raise RuntimeError(f"Failed to initialize CohereEmbeddings: {e}")
 
 try:
-    # Groq client
     groq_client = Groq(api_key=GROQ_API_KEY)
     logger.info("Groq client initialized successfully.")
 except Exception as e:
@@ -48,265 +49,316 @@ CHUNK_SIZE = 512
 CHUNK_OVERLAP = 50
 
 # Limits
-MAX_DOCUMENTS = 20        # max docs you’ll accept
-MAX_CHUNKS_PER_DOC = 100  # assume ~100 chunks per document. This is an upper bound.
+MAX_DOCUMENTS = 20          # max unique documents you’ll accept
+MAX_CHUNKS_PER_DOC = 100    # max chunks from a single document
+MAX_DOCUMENT_FILE_SIZE_MB = 10 # Max file size to prevent large uploads from consuming all RAM
+# Interpreting "1000 pages" as max content length to avoid memory issues with huge files.
+# A rough estimate: 1 page ~ 2000 chars (including spaces), 1000 pages ~ 2,000,000 chars.
+MAX_DOCUMENT_TEXT_LENGTH = 2 * 1024 * 1024 # Approx 2MB of text content
 
-# Vector store file (persist embeddings + texts + metadata)
-VECTOR_STORE_PATH = "vectors.pkl" # This file will be on Render's ephemeral disk.
+# --- VECTOR DATABASE CONFIG ───────────────────────────────────────────────────
 
-# --- IN‐MEMORY VECTOR STORE STRUCTURE ──────────────────────────────────────────
+# ChromaDB persistence directory
+# IMPORTANT: On Render's free/basic tiers, this directory will be on ephemeral disk.
+# Data stored here WILL BE LOST when your service restarts or scales.
+# For persistent data, consider Render's Persistent Disk or an external vector DB.
+CHROMA_DB_DIR = "./chroma_db"
+os.makedirs(CHROMA_DB_DIR, exist_ok=True)
+logger.info(f"ChromaDB persistence directory: {CHROMA_DB_DIR}")
 
-# We store a dict:
-# {
-#   "ids":    List[str],
-#   "texts":  List[str],
-#   "embs":   List[List[float]],  # dense vectors (Cohere dims)
-#   "source": List[str],          # doc_id for each chunk
-# }
-
-# Initialize vector_store globally. Load existing data if available.
-# This assumes the 'vectors.pkl' file is small enough to fit into Render's RAM.
-# For larger datasets, a persistent database is recommended.
-vector_store: Dict = {"ids": [], "texts": [], "embs": [], "source": []}
-if os.path.exists(VECTOR_STORE_PATH):
-    try:
-        with open(VECTOR_STORE_PATH, "rb") as f:
-            loaded_store = pickle.load(f)
-            # Basic validation to ensure the loaded data has the expected structure
-            if all(key in loaded_store for key in ["ids", "texts", "embs", "source"]):
-                vector_store = loaded_store
-                logger.info(f"Loaded existing vector store from {VECTOR_STORE_PATH} with {len(vector_store['ids'])} chunks.")
-            else:
-                logger.warning(f"Invalid format found in {VECTOR_STORE_PATH}. Starting with an empty store.")
-    except Exception as e:
-        logger.error(f"Error loading vector store from {VECTOR_STORE_PATH}: {e}. Starting with an empty store.")
-else:
-    logger.info("No existing vector store found. Starting with an empty store.")
-
-def persist_store():
-    """Write vector_store back to disk."""
-    try:
-        with open(VECTOR_STORE_PATH, "wb") as f:
-            pickle.dump(vector_store, f)
-        logger.info(f"Vector store persisted to {VECTOR_STORE_PATH}.")
-    except Exception as e:
-        logger.error(f"Error persisting vector store to {VECTOR_STORE_PATH}: {e}")
+# Initialize ChromaDB client
+try:
+    vector_store = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embeddings)
+    logger.info("ChromaDB initialized successfully.")
+except Exception as e:
+    logger.error(f"Error initializing ChromaDB: {e}")
+    raise RuntimeError(f"Failed to initialize ChromaDB: {e}")
 
 # --- FASTAPI APP & Pydantic MODELS ─────────────────────────────────────────────
 
-app = FastAPI()
+app = FastAPI(
+    title="RAG API",
+    description="Retrieval-Augmented Generation API for document querying.",
+    version="1.0.0",
+)
 
 class QueryRequest(BaseModel):
     question: str
 
 # --- DOCUMENT PROCESSING ──────────────────────────────────────────────────────
 
-def process_document_text(text: str, doc_id: str):
+# Mapping file extensions/MIME types to LangChain loaders
+# Note: For complex parsing, 'unstructured' library would be powerful but adds dependencies.
+# We're sticking to simpler loaders here.
+FILE_LOADERS = {
+    "application/pdf": PyPDFLoader,
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": Docx2textLoader,
+    "text/plain": TextLoader,
+    "text/markdown": TextLoader,
+}
+
+def load_document_from_temp_file(file_path: str, content_type: str) -> List[LangchainDocument]:
     """
-    1. Chunk `text` into ~CHUNK_SIZE tokens (roughly) with overlap.
-    2. Embed each chunk via Cohere API.
-    3. Append to in‐memory store and persist.
+    Loads a document from a temporary file path using the appropriate LangChain loader.
+    """
+    loader_class = None
+    for mime_type, cls in FILE_LOADERS.items():
+        if content_type.startswith(mime_type): # Use startswith for broader matching
+            loader_class = cls
+            break
+
+    if not loader_class:
+        raise ValueError(f"Unsupported content type: {content_type}")
+
+    # TextLoader expects a single file path. Others might too.
+    # PyPDFLoader needs a file path. Docx2textLoader needs a file path.
+    loader = loader_class(file_path)
+    return loader.load()
+
+
+def process_document(doc_id: str, file_path: str, original_filename: str, content_type: str):
+    """
+    1. Load document content from file based on type.
+    2. Chunk text into manageable sizes.
+    3. Add chunks to ChromaDB.
     """
     try:
-        # 1) split into chunks
+        # 1) Load document content
+        raw_documents: List[LangchainDocument] = load_document_from_temp_file(file_path, content_type)
+        if not raw_documents:
+            logger.warning(f"No content loaded for document {doc_id} from {original_filename}.")
+            return
+
+        # Concatenate all page content for initial length check and chunking
+        full_text_content = "\n".join([doc.page_content for doc in raw_documents])
+
+        if len(full_text_content) > MAX_DOCUMENT_TEXT_LENGTH:
+            logger.warning(f"Document {original_filename} (ID: {doc_id}) text length "
+                           f"({len(full_text_content)} chars) exceeds MAX_DOCUMENT_TEXT_LENGTH "
+                           f"({MAX_DOCUMENT_TEXT_LENGTH} chars). Truncating.")
+            full_text_content = full_text_content[:MAX_DOCUMENT_TEXT_LENGTH]
+            # Recreate raw_documents with truncated content if needed, or just proceed with full_text_content for chunking.
+            # For simplicity, we'll just use the truncated full_text_content for splitting.
+
+        # 2) Split into chunks
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
             length_function=len,
         )
-        chunks = text_splitter.split_text(text)
-        logger.info(f"Document {doc_id} split into {len(chunks)} chunks.")
+        # Split the full text content, or the raw_documents if they have metadata per page
+        chunks = text_splitter.split_text(full_text_content) # This creates simple strings
 
-        # Enforce a max‐chunks cap
+        # Or, if you want to preserve page metadata:
+        # chunks = text_splitter.split_documents(raw_documents)
+        # For simplicity with Chroma's add_texts, we'll use split_text and assign common metadata.
+
         if len(chunks) > MAX_CHUNKS_PER_DOC:
             logger.warning(f"Document {doc_id} has {len(chunks)} chunks, capping at {MAX_CHUNKS_PER_DOC}.")
             chunks = chunks[:MAX_CHUNKS_PER_DOC]
 
-        # 2) get embeddings from Cohere
-        #    CohereEmbeddings.embed_documents returns List[List[float]]
-        embs: List[List[float]] = embeddings.embed_documents(chunks)
-        logger.info(f"Generated embeddings for {len(embs)} chunks of document {doc_id}.")
+        if not chunks:
+            logger.warning(f"No chunks generated for document {doc_id} after splitting. Skipping.")
+            return
 
-        # 3) acquire lock before modifying shared vector_store (important for concurrency)
-        # Note: For simplicity and given Python's GIL, a global lock isn't strictly
-        # necessary for simple list appends, but it's good practice for shared state.
-        # However, for a single-process FastAPI background task, current approach is fine.
-        # If using multiple worker processes, a more robust locking mechanism or
-        # a process-safe data structure would be needed.
-        for i, chunk_text in enumerate(chunks):
-            chunk_id = f"{doc_id}_{i}"
-            vector_store["ids"].append(chunk_id)
-            vector_store["texts"].append(chunk_text)
-            vector_store["embs"].append(embs[i])
-            vector_store["source"].append(doc_id)
+        # Prepare metadata for each chunk
+        metadatas = []
+        for i in range(len(chunks)):
+            metadatas.append({
+                "doc_id": doc_id,
+                "filename": original_filename,
+                "chunk_index": i,
+                "source_type": content_type
+            })
 
-        # 4) persist to disk (after all appends for this doc are done)
-        persist_store()
-        logger.info(f"Finished processing and persisting document {doc_id}.")
+        # 3) Add chunks to ChromaDB
+        # Chroma's add_texts method will embed the texts and add them to the collection
+        vector_store.add_texts(
+            texts=chunks,
+            metadatas=metadatas,
+            ids=[f"{doc_id}_{i}" for i in range(len(chunks))] # Explicit IDs for Chroma
+        )
+        logger.info(f"Successfully processed and added {len(chunks)} chunks for document {original_filename} (ID: {doc_id}) to ChromaDB.")
+
+    except ValueError as ve:
+        logger.error(f"Error loading document {original_filename} (ID: {doc_id}): {ve}")
     except Exception as e:
-        logger.error(f"Error processing document {doc_id}: {e}")
-        # Consider a mechanism to report failed background tasks to the user if critical
+        logger.error(f"Error processing document {original_filename} (ID: {doc_id}): {e}")
+    finally:
+        # Clean up the temporary file
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            logger.debug(f"Cleaned up temporary file: {file_path}")
+
 
 @app.post("/upload")
 async def upload_document(file: UploadFile, background_tasks: BackgroundTasks):
     """
-    Client uploads a text file (plain .txt or .md). We read it entirely as text.
-    Then we enqueue `process_document_text` via BackgroundTasks so that FastAPI responds immediately.
+    Client uploads a document file (plain text, markdown, PDF, DOCX).
+    We save it to a temporary file, then enqueue `process_document` via BackgroundTasks.
     """
-    # 1) enforce max documents: roughly check if existing doc_ids >= MAX_DOCUMENTS
-    # Using a set for unique doc_ids is good.
-    existing_doc_ids = set(vector_store["source"])
-    if len(existing_doc_ids) >= MAX_DOCUMENTS:
-        logger.warning(f"Document limit reached ({len(existing_doc_ids)} >= {MAX_DOCUMENTS}). Rejecting upload.")
-        raise HTTPException(status_code=400, detail=f"Document limit reached. Max {MAX_DOCUMENTS} documents allowed.")
+    # 1) enforce max documents
+    # Note: ChromaDB doesn't directly give 'doc_ids' count easily without iterating,
+    # so we'll query for existing source doc_ids as a proxy for the limit.
+    existing_doc_ids_count = len(vector_store.get(where={}, include=['metadatas'])['metadatas'])
+    unique_doc_ids = set()
+    for metadata in vector_store.get(include=['metadatas'])['metadatas']:
+        if 'doc_id' in metadata:
+            unique_doc_ids.add(metadata['doc_id'])
 
-    # 2) read file bytes
-    if file.content_type not in ["text/plain", "text/markdown"]:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Only plain text (.txt) or markdown (.md) allowed.")
+    if len(unique_doc_ids) >= MAX_DOCUMENTS:
+        logger.warning(f"Document limit reached ({len(unique_doc_ids)} >= {MAX_DOCUMENTS}). Rejecting upload.")
+        raise HTTPException(status_code=400, detail=f"Document limit reached. Max {MAX_DOCUMENTS} unique documents allowed.")
 
-    try:
-        content_bytes = await file.read()
-        text_str = content_bytes.decode("utf-8")
-        logger.info(f"Received upload: {file.filename}, size: {len(content_bytes)} bytes.")
-    except UnicodeDecodeError:
-        logger.error(f"Unable to decode upload {file.filename} as UTF-8 text.")
-        raise HTTPException(status_code=400, detail="Unable to decode upload as UTF-8 text")
-    except Exception as e:
-        logger.error(f"Error reading uploaded file {file.filename}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error reading uploaded file: {e}")
+    # 2) Validate file type and size
+    if file.content_type not in FILE_LOADERS:
+        supported_types = ", ".join(FILE_LOADERS.keys())
+        logger.warning(f"Unsupported file type: {file.content_type}. Supported: {supported_types}")
+        raise HTTPException(status_code=400, detail=f"Unsupported file type. Supported types: {supported_types}")
 
-    # 3) new doc_id and background‐enqueue
+    file_size_mb = file.size / (1024 * 1024) if file.size else 0
+    if file_size_mb > MAX_DOCUMENT_FILE_SIZE_MB:
+        logger.warning(f"File {file.filename} size ({file_size_mb:.2f}MB) exceeds limit ({MAX_DOCUMENT_FILE_SIZE_MB}MB).")
+        raise HTTPException(status_code=400, detail=f"File size exceeds {MAX_DOCUMENT_FILE_SIZE_MB}MB limit.")
+
+    # 3) Save file to a temporary location
     doc_id = str(uuid.uuid4())
-    background_tasks.add_task(process_document_text, text_str, doc_id)
-    logger.info(f"Document {doc_id} enqueued for processing.")
+    temp_file_path = ""
+    try:
+        # Use tempfile to create a secure temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            temp_file_path = temp_file.name
+            file_content = await file.read()
+            temp_file.write(file_content)
+        logger.info(f"Saved uploaded file {file.filename} to temporary path: {temp_file_path}")
+
+        # 4) Enqueue processing
+        background_tasks.add_task(process_document, doc_id, temp_file_path, file.filename, file.content_type)
+
+    except Exception as e:
+        logger.error(f"Error during file upload or temporary save for {file.filename}: {e}")
+        # Ensure temp file is cleaned up if an error occurs before background task
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        raise HTTPException(status_code=500, detail=f"Failed to process upload: {e}")
 
     return {"id": doc_id, "status": "processing", "message": "Document is being processed in the background."}
 
 # --- SIMILARITY SEARCH & QUERY ─────────────────────────────────────────────────
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Compute cosine similarity between two 1D NumPy arrays."""
-    # Add a small epsilon to avoid division by zero for zero vectors, though unlikely with embeddings
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 0.0 # Or raise an error, depending on desired behavior for zero vectors
-    return float(np.dot(a, b) / (norm_a * norm_b))
-
-def retrieve_top_k(question: str, k: int = 3):
-    """
-    1) Embed the `question` via CohereEmbedding API (list of floats).
-    2) Compute cosine similarity against all stored embeddings.
-    3) Return top‐k chunks (dicts) with highest similarity.
-    """
-    if not vector_store["embs"]:
-        logger.info("No embeddings in store, returning empty for retrieve_top_k.")
-        return []
-
-    try:
-        # 1) embed question
-        q_emb: List[float] = embeddings.embed_query(question)
-        q_vec = np.array(q_emb).reshape((1, -1)) # Ensure q_vec is 2D for dot product
-        logger.debug("Question embedded.")
-
-        # Ensure embs_array is numpy array for efficient operations
-        embs_array = np.array(vector_store["embs"])
-
-        # Handle case where embs_array might be empty after conversion or has wrong shape
-        if embs_array.size == 0 or embs_array.shape[1] != q_vec.shape[1]:
-            logger.warning("Embeddings array is empty or has mismatched dimensions for similarity calculation.")
-            return []
-
-        # 2) compute similarities using optimized numpy operations
-        # Cosine similarity formula: A · B / (||A|| * ||B||)
-        # We calculate (A · B) and (||A|| * ||B||) separately.
-
-        dot_products = np.dot(embs_array, q_vec.T).flatten()  # shape (N,)
-        embs_norms = np.linalg.norm(embs_array, axis=1)      # shape (N,)
-        q_norm = np.linalg.norm(q_vec)                       # scalar
-
-        # Avoid division by zero for any zero-norm vectors
-        denominator = embs_norms * q_norm
-        # Create a mask for non-zero denominators
-        non_zero_denominators_mask = denominator != 0
-        cos_sims = np.zeros_like(dot_products, dtype=float) # Initialize with zeros
-        cos_sims[non_zero_denominators_mask] = dot_products[non_zero_denominators_mask] / denominator[non_zero_denominators_mask]
-
-        logger.debug("Cosine similarities calculated.")
-
-        # 3) pick top k indices
-        # Use np.argsort for sorting and then slicing for top k
-        top_k_idx = np.argsort(cos_sims)[::-1][:k] # Sort descending and take top k
-        logger.debug(f"Retrieved top {k} indices.")
-
-        # 4) build result list of dicts
-        results = []
-        for idx in top_k_idx:
-            # Ensure index is within bounds before accessing
-            if 0 <= idx < len(vector_store["ids"]):
-                results.append({
-                    "chunk_id": vector_store["ids"][idx],
-                    "text": vector_store["texts"][idx],
-                    "source": vector_store["source"][idx],
-                    "score": float(cos_sims[idx]) # Convert numpy float to Python float
-                })
-        logger.info(f"Retrieved {len(results)} top chunks for question.")
-        return results
-    except Exception as e:
-        logger.error(f"Error in retrieve_top_k: {e}")
-        return []
-
-
 @app.post("/query")
 async def query_documents(request: QueryRequest):
     """
-    1) Retrieve top-k chunks for the question.
+    1) Retrieve top-k chunks for the question using ChromaDB.
     2) Build a prompt: “Answer using context: < concatenated chunks >”
     3) Call Groq’s chat endpoint for generation.
     4) Return the generated answer.
     """
-    # 1) similarity search
-    top_chunks = retrieve_top_k(request.question, k=3)
+    if vector_store._collection.count() == 0: # Check if ChromaDB has any documents
+        logger.info("ChromaDB is empty, no documents to query.")
+        return {"answer": "No documents indexed yet. Please upload documents first."}
 
-    if not top_chunks:
-        logger.info("No relevant chunks found for the query.")
-        return {"answer": "No relevant information found in the indexed documents. Please upload more documents."}
-
-    # 2) build context
-    context = "\n\n".join([chunk["text"] for chunk in top_chunks])
-    logger.debug(f"Context built from {len(top_chunks)} chunks.")
-
-    # 3) call Groq API
     try:
+        # 1) Similarity search using ChromaDB's built-in similarity search
+        # It returns LangchainDocument objects with page_content and metadata
+        retrieved_docs: List[LangchainDocument] = vector_store.similarity_search(
+            query=request.question,
+            k=3 # Retrieve top 3 chunks
+        )
+        logger.info(f"ChromaDB retrieved {len(retrieved_docs)} relevant chunks for the query.")
+
+        if not retrieved_docs:
+            logger.info("No relevant chunks found by ChromaDB for the query.")
+            return {"answer": "No relevant information found in the indexed documents."}
+
+        # 2) Build context from retrieved chunks
+        context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+        logger.debug(f"Context built from {len(retrieved_docs)} chunks.")
+
+        # 3) Call Groq API
         response = groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": f"You are a helpful assistant. Answer the question using only the provided context. If the answer cannot be found in the context, state that clearly."},
+                {"role": "system", "content": f"You are a helpful assistant. Answer the question using only the provided context. If the answer cannot be found in the context, state that clearly and do not make up information."},
                 {"role": "user", "content": f"Context: {context}\n\nQuestion: {request.question}"}
             ],
-            model="llama3-8b-8192", # Or "mixtral-8x7b-32768" for potentially better results but higher latency
+            model="llama3-8b-8192",
             max_tokens=512,
             temperature=0.3,
-            stream=False # For a single response, stream=False is fine.
+            stream=False
         )
         answer = response.choices[0].message.content
         logger.info("Groq API call successful.")
     except Exception as e:
-        logger.error(f"Groq API error during query: {e}")
-        raise HTTPException(status_code=500, detail=f"Groq API error: {str(e)}")
+        logger.error(f"Error during query processing or Groq API call: {e}")
+        raise HTTPException(status_code=500, detail=f"An error occurred during query: {str(e)}")
 
     return {"answer": answer}
 
-# --- HEALTH CHECK ──────────────────────────────────────────────────────────────
+# --- METADATA & HEALTH CHECKS ──────────────────────────────────────────────────
+
+@app.get("/")
+async def root():
+    """
+    Root endpoint to confirm the RAG API is running.
+    """
+    return {"message": "RAG API is running!", "status": "ok"}
 
 @app.get("/healthz")
 def health_check():
-    indexed_docs_count = len(set(vector_store["source"]))
-    total_chunks_count = len(vector_store["ids"])
-    logger.info(f"Health check: {indexed_docs_count} indexed documents, {total_chunks_count} total chunks.")
-    return {
-        "status": "ok",
-        "indexed_documents": indexed_docs_count,
-        "total_chunks_indexed": total_chunks_count,
-        "vector_store_size_bytes": os.path.getsize(VECTOR_STORE_PATH) if os.path.exists(VECTOR_STORE_PATH) else 0
-    }
-    
+    """
+    Basic health check including indexed document count.
+    """
+    try:
+        # ChromaDB's _collection.count() is efficient for total chunks
+        total_chunks_indexed = vector_store._collection.count()
+        # To get unique document IDs, we'd query all metadatas, which can be slow for very large Dbs.
+        # For a hard limit of 20 docs, this is acceptable.
+        unique_doc_ids_metadata = vector_store.get(where={}, include=['metadatas'])['metadatas']
+        indexed_docs_count = len(set(m['doc_id'] for m in unique_doc_ids_metadata if 'doc_id' in m))
+
+        chroma_db_size_bytes = 0
+        if os.path.exists(CHROMA_DB_DIR) and os.path.isdir(CHROMA_DB_DIR):
+            for dirpath, dirnames, filenames in os.walk(CHROMA_DB_DIR):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    if os.path.isfile(fp):
+                        chroma_db_size_bytes += os.path.getsize(fp)
+
+        logger.info(f"Health check: {indexed_docs_count} indexed documents, {total_chunks_indexed} total chunks in ChromaDB.")
+        return {
+            "status": "ok",
+            "indexed_documents": indexed_docs_count,
+            "total_chunks_indexed": total_chunks_indexed,
+            "chroma_db_size_bytes": chroma_db_size_bytes
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
+
+
+@app.get("/documents")
+async def list_documents_metadata():
+    """
+    Endpoint to view metadata of all processed documents.
+    """
+    try:
+        all_metadatas = vector_store.get(include=['metadatas'])['metadatas']
+        
+        # Group by unique doc_id
+        documents_info = {}
+        for meta in all_metadatas:
+            doc_id = meta.get('doc_id')
+            if doc_id:
+                if doc_id not in documents_info:
+                    documents_info[doc_id] = {
+                        "doc_id": doc_id,
+                        "filename": meta.get('filename', 'N/A'),
+                        "source_type": meta.get('source_type', 'N/A'),
+                        "chunk_count": 0
+                    }
+                documents_info[doc_id]["chunk_count"] += 1
+        
+        return {"documents": list(documents_info.values()), "total_unique_documents": len(documents_info)}
+    except Exception as e:
+        logger.error(f"Error listing document metadata: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve document metadata: {str(e)}")
