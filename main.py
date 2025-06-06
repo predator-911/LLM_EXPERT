@@ -1,5 +1,7 @@
 # main.py
 
+# main.py
+
 import os
 import uuid
 import pickle
@@ -7,20 +9,28 @@ import numpy as np
 from typing import List, Dict
 from fastapi import FastAPI, UploadFile, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-# old import
-# from groq import AsyncGroq
-from groq import GroqClient  # ✅ updated import
-
-...
-
-# old client initialization
-# groq_client = Groq(api_key=GROQ_API_KEY)
-  # ✅ updated usage
+# Corrected import
+from groq import Groq  # ✅ Updated to use Groq class
 from langchain.embeddings import CohereEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 
+# You must set these in Render's env‐vars: COHERE_API_KEY and GROQ_API_KEY
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not COHERE_API_KEY:
+    raise RuntimeError("COHERE_API_KEY environment variable is required")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY environment variable is required")
+
+# Cohere embedder (no local model load; calls Cohere’s API)
+embeddings = CohereEmbeddings(model="embed-english-v2", cohere_api_key=COHERE_API_KEY)
+
+# Groq client - Corrected initialization
+groq_client = Groq(api_key=GROQ_API_KEY)  # ✅ Using Groq class
+
+# ... rest of the code remains unchanged ...
 # You must set these in Render's env‐vars: COHERE_API_KEY and GROQ_API_KEY
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
