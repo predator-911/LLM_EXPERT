@@ -7,7 +7,7 @@ import numpy as np
 from typing import List, Dict
 from fastapi import FastAPI, UploadFile, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from groq import Groq
+from groq import AsyncGroq
 from langchain.embeddings import CohereEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
