@@ -64,6 +64,7 @@ docker-compose up --build
 ```
 
 The API will be available at `https://llm-expert.onrender.com`
+The LiveDemo will be available at `https://huggingface.co/spaces/Predator911/LLMExpert`
 
 ## 📚 API Endpoints
 
