@@ -63,7 +63,7 @@ COHERE_API_KEY=your_cohere_api_key_here
 docker-compose up --build
 ```
 
-The API will be available at `http://localhost:8000`
+The API will be available at `https://llm-expert.onrender.com`
 
 ## 📚 API Endpoints
 
