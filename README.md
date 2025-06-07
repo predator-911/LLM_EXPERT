@@ -44,7 +44,7 @@ graph TB
 ### 1. Clone the Repository
 
 ```bash
-git clone <your-repo-url>
+git clone <https://github.com/predator-911/LLM_EXPERT>
 cd rag-api
 ```
 
